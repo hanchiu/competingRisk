@@ -1,0 +1,176 @@
+
+
+%macro bootstrap3(data=,outcome=,nsamples=,compmacro=,samplesize=,resultdatatemp=,coeff=,coeff2=,coeff3=);
+
+%*create data set with number of hits for each individual id for bootstrap; 
+data _idholders_ (index = (bsample));
+     do bsample = 0 to &nsamples ;
+         do _newid_ = 1 to &samplesize;
+           output ;
+         end;
+     end;
+     run;
+
+     proc surveyselect data= _idholders_ 
+         method = urs
+         n= &samplesize
+         seed = 1232  
+         out = _idsamples (keep = bsample _newid_  numberhits  ) 
+         outall    
+                 ;
+      strata bsample ;
+      run;
+
+      data _idsamples ; 
+      set _idsamples ;
+      if bsample = 0 then numberhits = 1 ;
+      run;
+
+%*add sequential newid to bytimes data set;
+  proc sort data=&data nodupkey out=indiv; by id; run;
+
+
+       data indiv (keep= _newid_ id);
+       set indiv;
+       _newid_ =_n_;
+       run;
+
+        proc sort data=indiv;
+        by id;
+        run;
+
+ proc sort data=&data;
+        by id;
+        run;
+        data &data;
+        merge indiv &data;
+        by id;
+        run;
+
+
+       %*bootstrap loop starts here - for now just have this;
+
+       %do bsample = 0 %to &nsamples;
+
+       %put bootstrap sample &bsample;
+
+       data &data ;
+          merge &data _idsamples (keep = _newid_ numberhits bsample 
+                                   where = (bsample = %eval(&bsample))
+                                    );
+          by _newid_  ;
+          drop bsample ;
+          run;
+
+
+	 
+
+  %&&compmacro;
+      	 
+
+       
+     
+
+
+
+  	 data results;
+	 set &resultdatatemp;
+	 _sample_ = &bsample;
+	 keep _sample_ &coeff &coeff2 &coeff3 ;
+	 run;
+
+
+	 %if &bsample=0 %then %do;
+    	     data resultsall;
+    	     set results;
+    	     run;
+	     %end;
+
+	%else %do;
+              proc append base = resultsall data = results;
+              run;
+	      %end;
+
+
+
+       %end; /*bootstrap loop*/
+       
+
+
+data bs;
+set resultsall;
+if _sample_ > 0;
+run;
+
+
+proc sort data=bs;
+by &coeff ;
+run;
+
+
+title 'sorted bs estiamtes, not including original';
+proc print data=bs;
+run;
+
+     proc univariate data=bs noprint;
+        var &coeff &coeff2 &coeff3 ;
+        output out = pctlci
+            pctlpre = est_  est2_ est3_ 
+            pctlname = lbpctl ubpctl
+            pctlpts = 2.5 97.5
+            ;
+
+proc sort data=resultsall;
+by _sample_;
+run;
+
+
+data pctlci2;
+set pctlci;
+_sample_ = 0;
+run;
+
+data pctlci3;
+merge pctlci2 resultsall;
+by _sample_ ;
+if _sample_=0;
+run;
+
+data pctlci4;
+set pctlci3;
+estimate=&coeff;
+lowerboundci=est_lbpctl;
+upperboundci=est_ubpctl;
+
+estimate2=&coeff2;
+lowerci2=est2_lbpctl;
+upperci2=est2_ubpctl;
+
+estimate3=&coeff3;
+lowerci3=est3_lbpctl;
+upperci3=est3_ubpctl;
+
+
+keep 
+estimate lowerboundci upperboundci 
+estimate2 lowerci2 upperci2
+estimate3 lowerci3 upperci3
+
+;
+run;
+
+title 'estimate plus bootstrap 95 percent cis lower and upper bound';
+proc print data=pctlci4;
+run;
+
+/*
+proc datasets library=work nolist;
+delete resultsall results wide1 _idsamples ls pctlci pctlci2 pctlci3 pctlci4 indiv bs testm  _idholders_; 
+run; 
+*/
+%mend;
+
+
+
+
+
