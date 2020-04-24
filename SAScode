@@ -1,0 +1,885 @@
+/**********************************************
+Aim: Effect of fertility treatment medications on neonatal outcomes in the presence of competing risk
+programmer: Yu-Han Chiu
+Date started: 12.25.2018; 
+Date finished: 10.30.2019
+
+Data Description:
+Exposure A(A=1): trt="B"  or letrozole=1 (letrozole)
+          (A=0): trt="C"  or letrozole=0 (gonadotropin)
+Outcomes (Y=1 or 0): neo2 (neonatal complication)
+Competing events (D=1 or 0): live_birth=0 then D=1; else D=0
+Baseline confounders L: 
+  pregloss (yes, no)  
+  amh_ab (amh levels >=1 and <3 vs outside this range)
+  old(age >=35 vs <35 years)
+  Hx_infertil_therapy (yes, no)
+
+*The AIMIGOS trial has 3 arms. 
+The analysis is restricted to two arms (arm1=299 women, arm2=301 women, total N=600); dataset named as two 
+***********************************************/
+
+libname  AMIGOS 'Y:/NICHD/data';
+/*libname  AMIGOS "Z:\AMIGOS"; */
+
+proc contents data=AMIGOS.amigos_combined_dash; run;
+/* proc delete data=work._all_; run; */
+
+/**********************************************************************************************************
+                        Data preparation
+Note: the AMIGOS has 3 arms ; we applied to 2 arms, trt=B (letrozole), and trt=C (gonadotropin)
+*****************************************************************************************************************/
+data threearms; set AMIGOS.amigos_combined_dash; 
+id=patient_study_id; 
+if live_birth=1 then D=0;
+else D=1;
+if amh>=3  then amh_ab=1; else amh_ab=0;
+if trt in ("B") then letrozole=1;
+else letrozole=0;
+if trt in ("C") then gonado=1;
+else gonado=0;
+if age<35 then old=0; else old=1;
+if nicu=1  or jaundice=1 or neonatal_hosp=1 or rds=1 then neo2=1;
+else neo2=0;
+/*Define composite outcomes*/
+if live_birth=0 then composite=1;
+else if neo2=1 then composite=1;
+else composite=0;
+run;
+
+
+data two0; set threearms; where trt in ("B", "C"); run;
+proc means data=two0 median mean std N;
+class trt;
+var preg_dur2;
+run;
+
+
+data two; set two0;
+if live_birth=0 then newneo=.; 
+else newneo=neo2; 
+neo3=neo2;
+/*
+Outcome variables (neo2, newneo) are coded in two ways. 
+When live_birth=0, neo2=0 
+When live_birth=0, newneo=.
+*/
+keep id neo2 trt letrozole old pregloss amh_ab Hx_infertil_therapy composite  live_birth D newneo neo3;
+run;
+
+
+options mprint;
+options notes;
+
+
+
+/**********************************************************************************************************
+Estimate causal estimand 1: composite outcome 
+*****************************************************************************************************************/
+
+proc genmod data=two descending; 
+class letrozole; 
+model composite= letrozole /dist=bin link=logit ; 
+lsmeans letrozole/diff cl ;
+run;
+
+/*compute 95%CI with 500 bootstraps*/
+%macro computemean1;
+proc genmod data=&data descending;
+class letrozole; 
+model &outcome=letrozole /dist=bin link=logit;
+lsmeans letrozole/diff cl  ;
+ods output lsmeans=ls0; 
+freq numberhits;
+run;
+
+proc transpose data=ls0 out=wide1 prefix=_;
+    id letrozole;
+    var Estimate;
+run;
+
+data testm;  set wide1;
+A1=exp(_1)/(1+exp(_1));
+A0=exp(_0)/(1+exp(_0));
+meanx=A1-A0;
+keep  A1 A0 meanx ;
+run;
+proc print data=testm;
+%mend;
+*change the location where you save the bootstrap.sas;
+%include "\\DON\hanchiu\AMIGOS\bootstrap1.sas";
+%bootstrap1(data=two,outcome=composite,nsamples=500,samplesize=600,compmacro=computemean1,resultdatatemp=testm,coeff=meanx);
+
+/**********************************************************************************************************
+Estimate causal estimand 2: Total effect (assign Y=0 after comepting events) 
+*****************************************************************************************************************/
+proc genmod data=two descending; 
+class trt; 
+model neo2= trt /dist=bin link=log ; 
+lsmeans letrozole/diff cl exp;
+run;
+
+%bootstrap1(data=two,outcome=neo2, nsamples=0,samplesize=600,compmacro=computemean1,resultdatatemp=testm,coeff=meanx);
+
+
+/**********************************************************************************************************
+Estimate causal estimand 3: controlled direct effect (competing events are censored events)
+Approach 3A: unweighted
+*****************************************************************************************************************/
+*restricting to live birth only;
+proc genmod data=two descending; 
+where live_birth=1;
+class letrozole; 
+model neo2= letrozole /dist=bin link=logit ; 
+lsmeans letrozole/diff cl;
+run;
+/*competinging approach restricted to live birth, so sampl esize=153*/
+data two_LB; set two; where D=0; run;
+%bootstrap1(data=two,outcome=neo2, nsamples=0,samplesize=153,compmacro=computemean1,resultdatatemp=testm,coeff=meanx);
+
+
+
+/******************************************************************************************************* 
+Estimate causal estimand 3: controlled direct effect (competing events are censored events)
+Approach 3B: weighted, by IPW
+weight=1/P[D=0, A=a|L], 
+if don't model treatment weight, then weight=1/P(D=0|L,A)
+************************************************************************************************************/
+%macro computemean3b;
+*fit weight separately for each arm, p_D0=P(D=0|L,A=1) ;
+proc logistic  data=&data;
+where letrozole=1;
+model D=   old pregloss amh_ab Hx_infertil_therapy ;
+output out=three_d1  p=p_D0;
+freq numberhits;
+run;
+
+*fit weight separately for each arm, p_D0=P(D=0|L,A=0) ;
+proc logistic  data=&data;
+where letrozole=0;
+model D=   old pregloss amh_ab Hx_infertil_therapy ;
+output out=three_d0  p=p_D0;
+freq numberhits;
+run;
+
+*stack arm 1 and arm 2 together. now N=600;
+data three;
+set three_d0 three_d1 ;
+run;
+
+*p_A=P(A=a|L) fitting on everyone, this step can be skipped as it is an RCT;
+*users can determine if they want to model treatment weight*;
+proc genmod data=three descending;
+class letrozole ;
+model letrozole= old pregloss amh_ab Hx_infertil_therapy /dist=bin link=logit;
+output out=four2 p=p_A;
+freq numberhits;
+run;
+
+
+*if A=1 and D=0  then  wt=1/(P(A=1|L)*P(D=0|L,A=1)=1/P(D=0,A=1|L);
+*if A=0 and D=0  then  wt=1/(P(A=0|L)*P(D=0|L,A=0)=1/P(D=0,A=0|L);
+*if D=0 then wt=0;
+data five; set four2;
+/*
+if letrozole=1 then do; wt=1/(p_A*p_D0)   ;    end; 
+if letrozole=0 then do; wt=1/((1-p_A)*p_D0);  end; */
+wt=1/p_D0   ;  
+if D=1 then wt=0;
+run;
+
+
+data five_LB; set five; where D=0; run;
+proc genmod data=five_LB descending; 
+class letrozole; 
+model &outcome= letrozole /dist=bin link=logit ; 
+lsmeans letrozole/diff cl ;
+weight wt;
+ods output lsmeans=ls3; 
+freq numberhits;
+run;
+
+proc transpose data=ls3 out=wide1 prefix=_;
+id letrozole;
+var Estimate;
+run;
+
+data testm;  set wide1;
+A1=exp(_1)/(1+exp(_1));
+A0=exp(_0)/(1+exp(_0));
+meanx=A1-A0;
+keep  A1 A0 meanx ;
+pro print data=testm; 
+
+%mend;
+%bootstrap1(data=two,outcome=neo2,nsamples=0,samplesize=600,compmacro=computemean3b,resultdatatemp=testm,coeff=meanx);
+
+
+
+/******************************************************************************************************* 
+Estimate causal estimand 3: controlled direct effect (competing events are censored events)
+Approach 3C: weighted, by g-formula (standardization)
+************************************************************************************************/
+*the competing risk model is fitted among S=1, take the coefficients should be taken from these subset ;
+proc format ;
+   value interv -1= "Observed"
+                 0= "gonadotropin"
+                 1= "letrozole"
+                 2= "letrozole - gonadotropin";
+run;
+
+
+/*create a dataset with 2 copies of each subject */
+data onesample2;set two;
+interv=-1; /*observed data*/
+output;
+interv=0;  /*1st copy: A set to 0, outcome=missing*/
+letrozole=0;
+neo2=.;
+newneo=.;
+output;
+interv=1;  /*2nd copy: A set to 1, outcome=missing*/
+letrozole=1;
+neo2=.;
+newneo=.;
+output;
+run;
+
+%macro computemean3c;
+*fit a outcome regression model, it will only use observed data (as outcomes are coded missing are 2 copies);
+*this model only fits to those with live birth, thus I used variable "newneo" instead of "neo2";
+proc genmod data=&data descending;
+class letrozole ;
+model &outcome=letrozole old pregloss amh_ab Hx_infertil_therapy/dist=bin link=logit;
+output out=predicty p=p_yl;
+freq numberhits;
+run;
+
+proc sort data = predicty ;
+	by  interv ;
+run;
+
+proc means data = predicty mean  ; 
+  	var p_yl ;  
+  	by  interv ;
+  	freq numberhits ;
+  	output out = all  mean(p_yl)=meanY ;
+run;
+
+proc transpose data = all out = for_diff ;
+	var meanY ;
+	by _TYPE_;
+run;
+
+data testm3c ;
+	set for_diff ;
+	Ya1=col3; /*interv=1*/
+	Ya0=col2; /*interv=0*/
+	interv = 2 ;
+	diff = col3 - col2 ;
+run;
+proc print data=testm3c; 
+var Ya1 Ya0 diff; run;
+
+%mend;
+%bootstrap1(data=onesample2,outcome=newneo,nsamples=500,samplesize=600,compmacro=computemean3c,resultdatatemp=testm3c,coeff=diff);
+/* 0.010813 -0.15060 0.17167  */
+
+
+/******************************************************************************************************* 
+Estimate causal estimand 3: controlled direct effect (competing events are censored events)
+Approach 3D: doubly robust method 
+************************************************************************************************/
+%macro computemean3D;
+*weight creation is the same as IPW (approach 3B);
+*fit weight separately for each arm, p_D0=P(D=0|L,A=1) ;
+proc logistic  data=&data descending;
+where letrozole=1;
+model live_birth=   old pregloss amh_ab Hx_infertil_therapy ;
+output out=three_d1  p=p_D0;
+freq numberhits;
+run;
+
+*fit weight separately for each arm, p_D0=P(D=0|L,A=0) ;
+proc logistic  data=&data descending;
+where letrozole=0;
+model live_birth=   old pregloss amh_ab Hx_infertil_therapy ;
+output out=three_d0  p=p_D0;
+freq numberhits;
+run;
+
+*stack arm 1 and arm 2 together. now N=600;
+data three;
+set three_d0 three_d1 ;
+sample=1;
+run;
+
+
+/*p_A=P(A=a|L) fitting on everyone; this step can be skipped as it is an RCT, */
+proc genmod data=three descending;
+class letrozole ;
+model letrozole= old pregloss amh_ab Hx_infertil_therapy /dist=bin link=logit;
+output out=four2 p=p_A;
+freq numberhits;
+run;
+
+
+*if A=1 and D=0  then  wt=1/(P(A=1|L)*P(D=0|L,A=1)=1/P(D=0,A=1|L);
+*if A=0 and D=0  then  wt=1/(P(A=0|L)*P(D=0|L,A=0)=1/P(D=0,A=0|L);
+*if D=0 then wt=0;
+/*
+data five; set four2;
+if letrozole=1 then do; wt=1/(p_A*p_D0);      end; 
+if letrozole=0 then do; wt=1/((1-p_A)*p_D0);  end;
+if D=1 then wt=0;
+wt1=wt*letrozole;
+wt0=wt*(1-letrozole) ;
+run;
+*/
+*if A=1 and D=0  then  wt=1/P(D=0|L,A=1);
+*if A=0 and D=0  then  wt=1/P(D=0|L,A=0);
+*if D=0 then wt=0;
+data five; set four2;
+if letrozole=1 then do; wt=1/p_D0;      end; 
+if letrozole=0 then do; wt=1/p_D0;  end;
+if D=1 then wt=0;
+wt1=wt*letrozole;
+wt0=wt*(1-letrozole) ;
+run;
+
+*here is similar to g-formula;
+data onesample3;set five;
+interv=-1; /*observed data*/ 
+output;
+interv=0;  /*1st copy: A set to 0, outcome=missing*/
+letrozole=0;
+neo2=.;
+newneo=.;
+output;
+interv=1;  /*2nd copy: A set to 1, outcome=missing*/
+letrozole=1;
+neo2=.;
+newneo=.;
+output;
+run;
+
+*fitting weighted outcome regression among D=0, P(Y|D=0,A,L)*; 
+*newneo=. if D=1, thus the model will fit among D=0;
+proc genmod data=onesample3 descending;
+model newneo= letrozole old pregloss amh_ab Hx_infertil_therapy /dist=bin link=logit;
+output out=predictga p=ga;
+freq numberhits;
+run;
+
+data predictga1 ; set predictga; where  interv=1 ; ga1=ga; drop ga letrozole neo2 newneo; run;
+data predictga0 ; set predictga; where  interv=0 ; ga0=ga; drop ga letrozole neo2 newneo; run;
+data predictga_ ; set predictga; where  interv=-1 ; run;
+
+proc sort data=predictga1; by id;
+proc sort data=predictga0; by id;
+proc sort data=predictga_; by id;
+
+data Fin;
+merge predictga1 predictga0 predictga_;
+by id;
+if  letrozole=1 then do; wtY1=wt1*neo2;   H1=wt1*(neo2-ga); end;
+if  letrozole=0 then do; wtY0=wt0*neo2;   H0=wt0*(neo2-ga); end;
+run;
+
+proc means data =  fin mean  sum; 
+  	var  wtY1 wtY0 H1 H0  wt1 wt0;  
+  	freq numberhits ;
+output out =join   
+sum(H1)=sum_H1   sum(H0)=sum_H0   sum(wtY1)=sum_wtY1 sum(wtY0)=sum_wtY0  sum(wt1)=sum_wt1 sum(wt0)=sum_wt0
+mean(ga1)=ave_ga1 mean(ga0)=ave_ga0 ;
+run;
+
+
+data testm3d; set join;
+ave_IPW1=sum_wtY1/sum_wt1;
+ave_IPW0=sum_wtY0/sum_wt0;
+ave_DR1=sum_H1/sum_wt1+ave_ga1;
+ave_DR0=sum_H0/sum_wt0+ave_ga0;
+/*Risk difference based on IPW, g-formula, doubly robust*/
+diff_IPW=ave_IPW1-ave_IPW0;
+diff_gform=ave_ga1-ave_ga0;
+diff_DR=ave_DR1-ave_DR0;
+run;
+proc print data=testm3d;
+run;
+
+%mend;
+
+%bootstrap3(data=two,outcome=newneo,nsamples=0,samplesize=600,compmacro=computemean3D,resultdatatemp=testm3d,coeff=diff_gform,coeff2=diff_IPW,coeff3=diff_DR);
+
+
+
+
+
+/**********************************************************************************************************
+Estimate causal estimand 4: separable effect 
+Approach 4A: by g-formula 
+Please refer to the original paper for the g-formula and two IPW estimators
+Mats J Stensrud, Jessica G Young, Vanessa Didelez, James M Robins, and Miguel A Hernan. Separable
+effects for causal inference in the presence of competing risks. arXiv preprint arXiv:1901.09472, 2019.
+*****************************************************************************************************************/
+* onesample 1 for fitting competing risk model, onesample 2 for fitting outcome model,*;
+data onesample;set two;
+interv=-1; /*observed data*/ 
+output;
+interv=0;  /*1st copy: A set to 0, outcome=missing*/
+letrozole=0;
+neo2=.;
+newneo=.;
+live_birth=.;
+output;
+interv=1;  /*2nd copy: A set to 1, outcome=missing*/
+letrozole=1;
+neo2=.;
+newneo=.;
+live_birth=.;
+output;
+run;
+
+%macro computemean4;
+*P(S=1|A,L)=P(D=0|A,L);
+proc logistic data=&data descending;
+class letrozole ; 
+model live_birth=letrozole old pregloss amh_ab Hx_infertil_therapy ;
+output out=predict_s p=ps;
+freq numberhits;
+run;
+
+*P(Y|A,L,D=0);
+proc logistic data=predict_s descending;
+class letrozole ;
+model newneo=letrozole old pregloss amh_ab Hx_infertil_therapy;
+output out=predict_y p=py;
+freq numberhits;
+run;
+
+
+data predict_interv1; set predict_y; 
+where interv=1;
+S_1=ps; /*P(D=0|A=1,L)*/
+Y_1=py; /*P(Y=1|D=0,A=1,l)*/
+keep id S_1 Y_1 _newid_;  
+run;
+
+data predict_interv0; set predict_y; 
+where interv=0;
+S_0=ps; /*P(D=0|A=0,L)*/
+Y_0=py; /*P(Y=1|D=0,A=0,l)*/
+/*keep id S_0 Y_0 _newid_;  */
+run;
+
+
+proc sort data=predict_interv0; by  id ;
+proc sort data=predict_interv1; by  id ;
+
+data combine;
+merge predict_interv0 predict_interv1  ;
+by id;
+Y10=Y_1*S_0;  /*P(Y=1|D=0,A=1,L)*P(D=0|A=0,L)  */
+Y01=Y_0*S_1;  /*P(Y=1|D=0,A=0,L)*P(D=0|A=1,L)  */
+Y11=Y_1*S_1;  /*P(Y=1|D=0,A=1,L)*P(D=0|A=1,L)  */
+Y00=Y_0*S_0;  /*P(Y=1|D=0,A=0,L)*P(D=0|A=0,L)  */
+/*two pairs of separable effect*/
+direct=Y10-Y00;
+indirect=Y11-Y10;
+
+direct1=Y11-Y01;
+indirect1=Y01-Y00;
+run;
+
+proc means data=combine mean;
+var   direct indirect direct1 indirect1 Y10 Y01 Y11 Y00;
+freq numberhits;
+output out=testm4  
+mean(direct)=direct 
+mean(indirect)=indirect
+mean(direct1)=direct1 
+mean(indirect1)=indirect1
+mean(Y10)=Y10
+mean(Y01)=Y01
+mean(Y11)=Y11
+mean(Y00)=Y00
+;
+run;
+
+      	 
+%mend;
+
+%bootstrap8(data=onesample,nsamples=500,compmacro=computemean4,samplesize=600,resultdatatemp=testm4,
+coeff=Y10, coeff2=Y01, coeff3=Y11,coeff4=Y00,coeff5=direct,coeff6=indirect,coeff7=direct1,coeff8=indirect1);
+
+
+
+
+
+/**********************************************************************************************************
+Estimate causal estimand 4: separable effect 
+Approach 4B: by IPW estimator 1
+*****************************************************************************************************************/
+%macro computemean42;
+data gem; set &data; 
+sample=1; /*fake variable, for merging purpose*/
+run;
+
+*P(D=0|L,A=1);
+proc logistic  data=gem  outest=outc4_A1 ;
+where letrozole=1;
+model D=old pregloss amh_ab Hx_infertil_therapy ;
+freq numberhits;
+run;
+
+*P(D=0|L,A=0);
+proc logistic  data=gem  outest=outc4_A0;
+where letrozole=0;
+model D=old pregloss amh_ab Hx_infertil_therapy ;
+freq numberhits;
+run;
+
+
+data parm_A0;
+set outc4_A0;
+if _type_='PARMS';
+array avar intercept          old       pregloss amh_ab Hx_infertil_therapy ;
+array abeta coef_intercept    coef_old coef_pregloss coef_amh_ab coef_Hx_infertil_therapy ;	
+do i=1 to dim(avar);
+abeta(i)=avar(i);
+end;
+sample=1;
+keep sample coef_intercept  coef_old coef_pregloss coef_amh_ab coef_Hx_infertil_therapy;
+run;
+
+data parm_A1;
+set outc4_A1;
+if _type_='PARMS';
+array avar intercept          old pregloss amh_ab Hx_infertil_therapy ;
+array abeta coef1_intercept   coef1_old coef1_pregloss coef1_amh_ab coef1_Hx_infertil_therapy ;	
+do i=1 to dim(avar);
+abeta(i)=avar(i);
+end;
+sample=1;
+keep sample coef1_intercept    coef1_old coef1_pregloss coef1_amh_ab coef1_Hx_infertil_therapy;
+run;
+
+
+
+data gem2 ;
+merge gem parm_A0 parm_A1;
+by sample;
+array avar     uno                old      pregloss amh_ab Hx_infertil_therapy ;
+array aboutc   coef_intercept     coef_old coef_pregloss coef_amh_ab coef_Hx_infertil_therapy;
+array aboutc1  coef1_intercept    coef1_old coef1_pregloss coef1_amh_ab coef1_Hx_infertil_therapy;
+uno=1;
+do i=1 to dim(avar);
+est1=sum(est1,aboutc1(i)*avar(i));
+est=sum(est,aboutc(i)*avar(i));
+p_D0_A1=exp(est1)/(1+exp(est1));  *P(D=0|L,A=1);
+p_D0_A0=exp(est)/(1+exp(est));    *P(D=0|L,A=0);
+end;
+if letrozole=1 then do; wt=1;       end; 
+if letrozole=0 then do; wt=1;       end; 
+if letrozole=1 then do; wtd=(p_D0_A0)/(P_D0_A1); end;      *WTd1=P(D=0|A=0,L)/P(D=0|A=1,L)*P(A=1,L);
+if letrozole=0 then do; wtd=(p_D0_A1)/(P_D0_A0);end;       *wTd0=P(D=0|A=1,L)/P(D=0|A=0,L)*P(A=0,L);
+run;
+
+data gem3; set gem2;
+wt1=wt*letrozole;
+wt0=wt*(1-letrozole) ;
+if letrozole=1 then do; wtY=wt1*neo2; end;
+if letrozole=0 then do; wtY=wt0*neo2; end;
+wtd1=wtd*(letrozole);
+wtd0=wtd*(1-letrozole);
+if letrozole=1 then do; wtdY=wtd1*neo2; end; *WTd1*Y(1-D)|A=Ay=1;
+if letrozole=0 then do; wtdY=wtd0*neo2; end;*WTd0*Y(1-D)|A=Ay=0;
+/*keep id trt arm1 arm0 neo2 letrozole wt1 wt0   wtd1 wtd0   arm1_ arm0_  sample;*/
+run;
+
+proc sort data=gem3; by letrozole; run;
+
+proc means N mean data=gem3;
+by letrozole;
+var wtY wtdY ;
+freq numberhits ;
+output out=testm
+mean(wtY)=ave_wtY
+mean(wtdY)=ave_wtdY
+;
+run;
+
+proc transpose data = testm out = testm2;
+	var ave_wtY;
+	by _TYPE_;
+run;
+
+proc transpose data = testm out = testm22 ;
+	var ave_wtDY;
+	by _TYPE_;
+run;
+
+data testm3 ;set testm2 ;
+	Y11=col2; /*interv=1*/
+	Y00=col1; /*interv=0*/
+drop col1 col2 _NAME_;
+run;
+data testm33 ;set testm22 ;
+	Y10=col2; /*interv=1*/
+	Y01=col1; /*interv=0*/
+drop col1 col2 _NAME_;
+run;
+
+
+data testm42; 
+merge testm3 testm33 ;
+by _type_;
+direct=Y10-Y00;
+indirect=Y11-Y10;
+direct1=Y11-Y01;
+indirect1=Y01-Y00;
+run;
+
+%mend;
+
+%bootstrap8(data=two,nsamples=500,compmacro=computemean42,samplesize=600,resultdatatemp=testm42,
+coeff=Y10, coeff2=Y01, coeff3=Y11,coeff4=Y00,coeff5=direct,coeff6=indirect,coeff7=direct1,coeff8=indirect1);
+
+
+
+/**********************************************************************************************************
+Estimate causal estimand 4: separable effect 
+Approach 4B: by IPW estimator 2
+*****************************************************************************************************************/
+
+%macro computemean42b;
+data lin; set &data; 
+sample=1;
+run;
+
+*P(Y=1|D=0,L,A=a);
+proc logistic  data=lin outest=outc4b_A1 descending;
+where letrozole=1;
+model newneo=  old pregloss amh_ab Hx_infertil_therapy ;
+freq numberhits;
+run;
+proc logistic  data=lin outest=outc4b_A0 descending;
+where letrozole=0;
+model newneo=  old pregloss amh_ab Hx_infertil_therapy ;
+freq numberhits;
+run;
+
+
+data para_A1;
+set outc4b_A1;
+if _type_='PARMS';
+array avar intercept         old pregloss amh_ab Hx_infertil_therapy ;
+array abeta coef_intercept   coef_old coef_pregloss coef_amh_ab coef_Hx_infertil_therapy ;	
+do i=1 to dim(avar);
+abeta(i)=avar(i);
+end;
+sample=1;
+keep sample coef_intercept  coef_old coef_pregloss coef_amh_ab coef_Hx_infertil_therapy;
+run;
+
+
+data para_A0;
+set outc4b_A0;
+if _type_='PARMS';
+array avar intercept          old pregloss amh_ab Hx_infertil_therapy ;
+array abeta coef1_intercept   coef1_old coef1_pregloss coef1_amh_ab coef1_Hx_infertil_therapy ;	
+do i=1 to dim(avar);
+abeta(i)=avar(i);
+end;
+sample=1;
+keep sample coef1_intercept    coef1_old coef1_pregloss coef1_amh_ab coef1_Hx_infertil_therapy;
+run;
+
+
+data lin2 ;
+merge para_A1 para_A0 lin;
+by sample;
+array avar    uno                     old      pregloss amh_ab Hx_infertil_therapy ;
+array aboutc  coef_intercept        coef_old coef_pregloss coef_amh_ab coef_Hx_infertil_therapy;
+array aboutc1  coef1_intercept     coef1_old coef1_pregloss coef1_amh_ab coef1_Hx_infertil_therapy;
+uno=1;
+do i=1 to dim(avar);
+est1=sum(est1,aboutc1(i)*avar(i));
+est= sum(est,aboutc(i)*avar(i));
+p_Y_D0A1=exp(est1)/(1+exp(est1));  *P(Y=1|D=0,L,A=1);
+p_Y_D0A0=exp(est)/(1+exp(est));    *P(Y=1|D=0,L,A=0);
+end;
+
+if letrozole=1 then do; wt=1;       end; 
+if letrozole=0 then do; wt=1;       end; 
+if letrozole=1 then do; wty=(p_Y_D0A1)/(p_Y_D0A0); end;   *wty1=P(Y=1|D=0,L,A=1)/P(Y=1|D=0,L,A=0);   
+if letrozole=0 then do; wty=(p_Y_D0A0)/(p_Y_D0A1); end;    *wty0=P(Y=1|D=0,L,A=0)/P(Y=1|D=0,L,A=1);    
+
+wt1=wt*letrozole;
+wt0=wt*(1-letrozole) ;
+if letrozole=1 then do; wt_Y=wt1*neo2; end;
+if letrozole=0 then do; wt_Y=wt0*neo2; end;
+wty1=wty*(1-letrozole);
+wty0=wty*(letrozole);
+if letrozole=0 then do; wty_Y=wty1*neo2;  end;
+if letrozole=1 then do; wty_Y=wty0*neo2;  end;
+/*keep id trt arm1 arm0 neo2 letrozole wt1 wt0   wty1 wty0   arm1_ arm0_ ;*/
+run;
+
+
+proc sort data=lin2; by letrozole; run;
+proc means N mean data=lin2;
+by letrozole;
+var wt_Y wty_Y ;
+freq numberhits ;
+output out=test
+mean(wt_Y)=ave_wtY
+mean(wty_Y)=ave_wtyY
+;
+run;
+
+proc transpose data = test out = test2;
+	var ave_wtY;
+	by _TYPE_;
+run;
+
+proc transpose data = test out = test22 ;
+	var ave_wtyY;
+	by _TYPE_;
+run;
+
+data test3 ;set test2 ;
+	Y11=col2; 
+	Y00=col1; 
+drop col1 col2 _NAME_;
+run;
+data test33 ;set test22 ;
+	Y01=col2; 
+	Y10=col1; 
+drop col1 col2 _NAME_;
+run;
+
+
+data testm42b; 
+merge test3 test33 ;
+by _type_;
+direct=Y10-Y00;
+indirect=Y11-Y10;
+direct1=Y11-Y01;
+indirect1=Y01-Y00;
+run;
+
+%mend;
+
+%bootstrap8(data=two,nsamples=500,compmacro=computemean42b,samplesize=600,resultdatatemp=testm42b,
+coeff=Y10, coeff2=Y01, coeff3=Y11,coeff4=Y00,coeff5=direct,coeff6=indirect,coeff7=direct1,coeff8=indirect1);
+
+
+/**********************************************************************************************************
+Estimate causal estimand 5: principal stratum effect (Simple regression based)
+The SAS code is adapted based on the appendix from the original paper below
+Eric J Tchetgen Tchetgen, Kelesitse Phiri, and Roger Shapiro. A simple regression-based approach to
+account for survival bias in birth outcomes research. Epidemiology, 26(4):473{480, 2015.
+*****************************************************************************************************************/
+%macro computemean5;
+data cohort_dups; set &data;
+by id;
+retain count;
+if first.id then count=0;
+run;
+
+data cohort_dups2; set cohort_dups;
+do dup=count to count+1;
+output;
+end;
+run;
+
+
+data cohort_dups3; set cohort_dups2;
+by id dup;
+if dup=1 then do;
+live_birth=.;
+letrozole=1-letrozole;
+end;
+run;
+
+*here, try to saturated the model as much as possible to get stable estimate of Q;
+proc logistic data=cohort_dups3 descending;
+model live_birth=letrozole old pregloss  Hx_infertil_therapy amh_ab 
+letrozole*old letrozole*Hx_infertil_therapy letrozole*pregloss    letrozole*Hx_infertil_therapy  letrozole*amh_ab
+          old*Hx_infertil_therapy old*pregloss    old*amh_ab
+          pregloss*Hx_infertil_therapy    pregloss*amh_ab
+          Hx_infertil_therapy*amh_ab
+letrozole*old*pregloss
+letrozole*old*amh_ab
+pregloss*old*Hx_infertil_therapy
+pregloss*amh_ab*Hx_infertil_therapy
+letrozole*old*pregloss*Hx_infertil_therapy;
+output out=predic_values p=phat; 
+freq numberhits;
+run;
+
+data exposure_0(rename=(letrozole=letrozole_0  live_birth=live_birth_0 phat=phat_0) drop=dup);
+set predic_values;
+where letrozole=0;
+run;
+
+data exposure_1(rename=(letrozole=letrozole_1 live_birth=live_birth_1 phat=phat_1) drop=dup);
+set predic_values;
+where letrozole=1;
+run;
+
+
+proc sort data=exposure_0; by id; run;
+proc sort data=exposure_1; by id; run;
+
+
+data cohort_aligned;
+merge exposure_0 exposure_1    ;
+by id;
+
+proc sort data=cohort_aligned; by id; run;
+proc sort data=two; by id; run;
+
+data cohort_aligned2;
+merge cohort_aligned two;
+by id;
+run;
+
+data cohort_sace (drop= live_birth_1 live_birth_0 letrozole_0 letrozole_1   count);
+set cohort_aligned2;
+if live_birth=0 then delete;
+if letrozole=1 then Q=(1-phat_1);
+else if letrozole=0 then Q=(1-phat_0);
+run;
+
+proc genmod data=cohort_sace descending;
+class letrozole; 
+model &outcome=letrozole  Q  old pregloss amh_ab Hx_infertil_therapy   /dist=bin link=log;
+lsmeans letrozole/diff cl  ;
+ods output lsmeans=ls ParameterEstimates=tab; 
+freq numberhits;
+run;
+
+data tab2; set tab;
+where Parameter="letrozole";
+run;
+
+proc transpose data=tab2 out=wide2 prefix=_;
+    id Level1;
+    var Estimate;
+run;
+
+
+data testm5;  set wide2;
+ratio=(_0)*(-1);
+rr=exp(ratio);
+keep   ratio rr;
+run;
+proc print data=testm5; run;
+
+%mend;
+%bootstrap1(data=two,outcome=neo2,nsamples=500,samplesize=600,compmacro=computemean5,resultdatatemp=testm5,coeff=rr);
+
+
